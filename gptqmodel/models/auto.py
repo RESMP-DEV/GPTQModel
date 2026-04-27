@@ -10,7 +10,6 @@ from contextlib import contextmanager
 
 from ..utils.logger import setup_logger
 
-
 log = setup_logger()
 
 ASCII_LOGO = r"""
@@ -41,14 +40,12 @@ if 'CUDA_VISIBLE_DEVICES' in os.environ and 'ROCR_VISIBLE_DEVICES' in os.environ
 
 import sys  # noqa: E402
 
-
 # TODO: waiting for pytorch implementgation of aten ops for MPS
 if sys.platform == "darwin":
     os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
 import os.path  # noqa: E402
 from os.path import isdir, join  # noqa: E402
-from typing import Dict, List, Optional, Union  # noqa: E402
 
 import torch  # noqa: E402
 from packaging.version import Version  # noqa: E402
@@ -60,12 +57,8 @@ from ..nn_modules.qlinear.torch import TorchLinear  # noqa: E402
 from ..quantization import METHOD, QUANT_CONFIG_FILENAME, QuantizeConfig  # noqa: E402
 from ..utils import BACKEND, PROFILE  # noqa: E402
 from ..utils.backend import normalize_backend, normalize_profile  # noqa: E402
-from ..utils.hf import (  # noqa: E402
-    get_hf_gguf_load_kwargs,
-    normalize_model_id_or_path_for_hf_gguf,
-    normalize_torch_dtype_kwarg,
-    resolve_trust_remote_code,
-)
+from ..utils.hf import (get_hf_gguf_load_kwargs, normalize_model_id_or_path_for_hf_gguf,  # noqa: E402
+                        normalize_torch_dtype_kwarg, resolve_trust_remote_code)
 from ..utils.hub import list_repo_files  # noqa: E402
 from ..utils.model import find_modules  # noqa: E402
 from ..utils.torch import torch_empty_cache  # noqa: E402
@@ -83,6 +76,7 @@ from .definitions.dbrx_converted import DbrxConvertedQModel  # noqa: E402
 from .definitions.decilm import DeciLMQModel  # noqa: E402
 from .definitions.deepseek_v2 import DeepSeekV2QModel  # noqa: E402
 from .definitions.deepseek_v3 import DeepSeekV3QModel  # noqa: E402
+from .definitions.deepseek_v4 import DeepSeekV4QModel  # noqa: E402
 from .definitions.dots1 import Dots1QModel  # noqa: E402
 from .definitions.dream import DreamQModel  # noqa: E402
 from .definitions.ernie4_5 import Ernie4_5QModel  # noqa: E402
@@ -96,12 +90,12 @@ from .definitions.gemma3 import Gemma3ForConditionalGenerationGPTQ, Gemma3QModel
 from .definitions.gemma3n import Gemma3nForConditionalGenerationGPTQ, Gemma3nTextQModel  # noqa: E402
 from .definitions.gemma4 import Gemma4ForConditionalGenerationGPTQ, Gemma4TextQModel  # noqa: E402
 from .definitions.glm import GlmQModel  # noqa: E402
-from .definitions.glmasr import GlmASRGPTQ  # noqa: E402
-from .definitions.glm_ocr import GlmOCRGPTQ  # noqa: E402
 from .definitions.glm4_moe import GLM4MoEGPTQ  # noqa: E402
 from .definitions.glm4_moe_lite import Glm4MoeLiteQModel  # noqa: E402
 from .definitions.glm4v import Glm4vGPTQ  # noqa: E402
 from .definitions.glm_moe_dsa import GlmMoeDsaQModel  # noqa: E402
+from .definitions.glm_ocr import GlmOCRGPTQ  # noqa: E402
+from .definitions.glmasr import GlmASRGPTQ  # noqa: E402
 from .definitions.gpt2 import GPT2QModel  # noqa: E402
 from .definitions.gpt_bigcode import GptBigCodeQModel  # noqa: E402
 from .definitions.gpt_neo import GptNeoQModel  # noqa: E402
@@ -158,7 +152,6 @@ from .definitions.starcoder2 import Starcoder2QModel  # noqa: E402
 from .definitions.telechat2 import TeleChat2QModel
 from .definitions.voxtral import VoxtralGPTQ  # noqa: E402
 from .definitions.xverse import XverseQModel  # noqa: E402
-
 
 TRANSFORMERS_SUPPORTS_QWEN3_5 = Version(TRANSFORMERS_VERSION) >= Version("5.2.0")
 if TRANSFORMERS_SUPPORTS_QWEN3_5:
@@ -251,6 +244,7 @@ MODEL_MAP = {
     "dbrx_converted": DbrxConvertedQModel,
     "deepseek_v2": DeepSeekV2QModel,
     "deepseek_v3": DeepSeekV3QModel,
+    "deepseek_v4": DeepSeekV4QModel,
     "dots1": Dots1QModel,
     "exaone": ExaOneQModel,
     "exaone4": Exaone4QModel,
@@ -294,7 +288,7 @@ if Qwen3_5_MoeQModel is not None:
 SUPPORTED_MODELS = list(MODEL_MAP.keys())
 
 
-def _activation_quantization_mode(quantization_config: dict) -> Optional[str]:
+def _activation_quantization_mode(quantization_config: dict) -> str | None:
     """Return the first activation-quantization field that makes this config unsupported.
 
     GPT-QModel can load weight-only quantized checkpoints through the Transformers
@@ -426,7 +420,7 @@ def check_and_get_model_definition(model_dir, trust_remote_code=False, **config_
 
 class GPTQModel:
     def __init__(self):
-        raise EnvironmentError(
+        raise OSError(
             "GPT-QModel is not designed to be instantiated\n"
             "use `from_pretrained()` to load a pretrained model and prepare for quantization via `.quantize()`.\n"
             "use `from_quantized()` for inference with a post-quantized model."
@@ -435,12 +429,12 @@ class GPTQModel:
     @classmethod
     def load(
             cls,
-            model_id_or_path: Optional[str],
-            quantize_config: Optional[QuantizeConfig | Dict] = None,
-            device_map: Optional[Union[str, Dict[str, Union[str, int]]]] = None,
-            device: Optional[Union[str, torch.device]] = None,
-            backend: Union[str, BACKEND] = BACKEND.AUTO,
-            profile: Union[str, int, PROFILE] = PROFILE.AUTO,
+            model_id_or_path: str | None,
+            quantize_config: QuantizeConfig | dict | None = None,
+            device_map: str | dict[str, str | int] | None = None,
+            device: str | torch.device | None = None,
+            backend: str | BACKEND = BACKEND.AUTO,
+            profile: str | int | PROFILE = PROFILE.AUTO,
             trust_remote_code: bool = False,
             **kwargs,
     ):
@@ -455,7 +449,7 @@ class GPTQModel:
         trust_remote_code = resolve_trust_remote_code(model_id_or_path, trust_remote_code=trust_remote_code)
 
         # normalize config to cfg instance
-        if isinstance(quantize_config, Dict):
+        if isinstance(quantize_config, dict):
             quantize_config = QuantizeConfig(**quantize_config)
 
         backend = normalize_backend(backend)
@@ -526,8 +520,8 @@ class GPTQModel:
             cls,
             model_id_or_path: str,
             quantize_config: QuantizeConfig,
-            backend: Union[str, BACKEND] = BACKEND.AUTO,
-            profile: Union[str, int, PROFILE] = PROFILE.AUTO,
+            backend: str | BACKEND = BACKEND.AUTO,
+            profile: str | int | PROFILE = PROFILE.AUTO,
             trust_remote_code: bool = False,
             **model_init_kwargs,
     ) -> BaseQModel:
@@ -582,11 +576,11 @@ class GPTQModel:
     @classmethod
     def from_quantized(
             cls,
-            model_id_or_path: Optional[str],
-            device_map: Optional[Union[str, Dict[str, Union[str, int]]]] = None,
-            device: Optional[Union[str, int]] = None,
-            backend: Union[str, BACKEND] = BACKEND.AUTO,
-            adapter: Optional[Adapter | Dict] = None,
+            model_id_or_path: str | None,
+            device_map: str | dict[str, str | int] | None = None,
+            device: str | int | None = None,
+            backend: str | BACKEND = BACKEND.AUTO,
+            adapter: Adapter | dict | None = None,
             trust_remote_code: bool = False,
             **kwargs,
     ) -> BaseQModel:
@@ -688,16 +682,16 @@ class GPTQModel:
             adapter: Adapter,
             model_id_or_path: str, # native model
             quantized_model_id_or_path: str, # gptqmodel quantized model
-            calibration_dataset: Union[List[Dict[str, Union[List[int], torch.LongTensor]]], List[str], List[int]],
-            calibration_dataset_concat_size: Optional[int] = None,
-            calibration_dataset_sort: Optional[str] = None,
-            batch_size: Optional[int] = 1,
-            tokenizer: Optional[PreTrainedTokenizerBase] = None,
-            calibration_concat_separator: Optional[str] = None,
+            calibration_dataset: list[dict[str, list[int] | torch.LongTensor]] | list[str] | list[int],
+            calibration_dataset_concat_size: int | None = None,
+            calibration_dataset_sort: str | None = None,
+            batch_size: int | None = 1,
+            tokenizer: PreTrainedTokenizerBase | None = None,
+            calibration_concat_separator: str | None = None,
             # pass-through vars for load()
             trust_remote_code: bool = False,
-            dtype: Optional[Union[str, torch.dtype]] = None,
-            device: Optional[Union[str, torch.device]] = None,
+            dtype: str | torch.dtype | None = None,
+            device: str | torch.device | None = None,
         ):
             if not adapter or not isinstance(adapter, Lora):
                 raise ValueError(f"Adapter: expected `adapter` type to be `Lora`: actual = `{adapter}`.")
@@ -714,7 +708,7 @@ class GPTQModel:
             )
 
             qcfg = quantized_model.quantize_config
-            qModules: Dict[str, TorchLinear] = find_modules(module=quantized_model.model, layers=[TorchLinear])
+            qModules: dict[str, TorchLinear] = find_modules(module=quantized_model.model, layers=[TorchLinear])
             # for name, module in qModules.items():
             #     quantized_weights[name] = module.dequantize_weight()
             del quantized_model

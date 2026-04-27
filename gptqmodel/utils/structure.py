@@ -35,17 +35,19 @@ import re
 import shutil
 import tempfile
 import threading
+from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from importlib import import_module
-from typing import Any, Dict, Iterable, Optional, Set, Tuple
+from typing import Any, Optional
 
 import pcre
 import torch
 from safetensors import safe_open
 from torch import nn
+from tqdm import tqdm
 
 from ..utils.logger import setup_logger
-
 
 # =========================
 #   ANSI color helpers
@@ -64,7 +66,7 @@ def _maybe(s: str, code: str, *, color: bool) -> str:
 # =========================
 #   Dtype size registry
 # =========================
-_DTYPE_BYTES: Dict[object, float] = {
+_DTYPE_BYTES: dict[object, float] = {
     torch.float32: 4, torch.float: 4,
     torch.bfloat16: 2,
     torch.float16: 2, torch.half: 2,
@@ -128,7 +130,7 @@ def _human_bytes(n: float) -> str:
 # =========================
 #   Counting & summaries
 # =========================
-def _param_summary(mod: nn.Module, *, recurse: bool = True) -> Tuple[int, int]:
+def _param_summary(mod: nn.Module, *, recurse: bool = True) -> tuple[int, int]:
     if recurse:
         p = sum(p.numel() for p in mod.parameters())
         b = sum(b.numel() for b in mod.buffers())
@@ -137,12 +139,12 @@ def _param_summary(mod: nn.Module, *, recurse: bool = True) -> Tuple[int, int]:
         b = sum(b.numel() for _, b in mod.named_buffers(recurse=False))
     return p, b
 
-def _counts_for_module(mod: nn.Module) -> Tuple[int, int]:
+def _counts_for_module(mod: nn.Module) -> tuple[int, int]:
     return _param_summary(mod, recurse=False)
 
 def _summarize_module_tensors(mod: nn.Module, *, recurse: bool = False):
-    dev_counts: Dict[str, int] = {}
-    dtype_set: Set[object] = set()
+    dev_counts: dict[str, int] = {}
+    dtype_set: set[object] = set()
     total_elems = 0
     alloc_bytes = 0.0
     est_bytes = 0.0
@@ -228,8 +230,8 @@ def print_module_tree(
     model: nn.Module,
     *,
     root_name: str = "model",
-    max_depth: Optional[int] = None,
-    filter_regex: Optional[str] = None,
+    max_depth: int | None = None,
+    filter_regex: str | None = None,
     show_params: bool = False,
     show_buffers: bool = False,
     show_all: bool = True,   # If True: show detailed lines for BOTH params and buffers (names included)
@@ -238,7 +240,7 @@ def print_module_tree(
     experts_regex: str = r"(^|\.)experts($|\.)",
     experts_show: int = 1,
     layers_regex: str = r"(^|\.)((model_)?layers|layer|h|blocks|block)($|\.)",
-    layers_show: Optional[int] = 4,
+    layers_show: int | None = 4,
 ):
     """
     Pretty-print a module tree with sizes, devices, dtypes, and optional param/buffer details.
@@ -400,7 +402,7 @@ def print_module_tree(
     _ = pcre.compile(filter_regex) if filter_regex else None  # reserved for future
     experts_path_re = pcre.compile(experts_regex)
     layers_name_re = pcre.compile(layers_regex) if layers_show is not None else None
-    seen: Set[int] = set()
+    seen: set[int] = set()
 
     total_p = sum(p.numel() for p in model.parameters())
     total_b = sum(b.numel() for b in model.buffers())  # fixed loop variable
@@ -698,10 +700,11 @@ class LazyTurtle:
         *,
         model_local_path: str,
         config: Any,
-        model_init_kwargs: Optional[Dict[str, Any]] = None,
-        module_tree: Optional[Any] = None,
-        hf_conversion_map_reversed: Optional[Any] = None,
-        target_model: Optional[nn.Module] = None,
+        model_init_kwargs: dict[str, Any] | None = None,
+        module_tree: Any | None = None,
+        hf_conversion_map_reversed: Any | None = None,
+        target_model: nn.Module | None = None,
+        device_map: dict[str, str] | None = None,
     ) -> None:
         self.config = copy.deepcopy(config)
         self._model_init_kwargs = dict(model_init_kwargs or {})
@@ -720,18 +723,23 @@ class LazyTurtle:
             else self.infer_hf_conversion_map_reversed(target_model=target_model),
         )
         self._runtime_to_checkpoint_renamings = tuple(alias_items)
+        self._device_map = device_map
         self._lock = threading.RLock()
+        self._preloaded_tensors: dict[str, torch.Tensor] = self._parallel_preload_weights(
+            device_map=device_map,
+        )
 
     @classmethod
     def maybe_create(
         cls,
         *,
-        model_local_path: Optional[str],
+        model_local_path: str | None,
         config: Any,
-        model_init_kwargs: Optional[Dict[str, Any]] = None,
-        module_tree: Optional[Any] = None,
-        hf_conversion_map_reversed: Optional[Any] = None,
-        target_model: Optional[nn.Module] = None,
+        model_init_kwargs: dict[str, Any] | None = None,
+        module_tree: Any | None = None,
+        hf_conversion_map_reversed: Any | None = None,
+        target_model: nn.Module | None = None,
+        device_map: dict[str, str] | None = None,
     ) -> Optional["LazyTurtle"]:
         if not model_local_path or not os.path.isdir(model_local_path):
             return None
@@ -744,6 +752,7 @@ class LazyTurtle:
                 module_tree=module_tree,
                 hf_conversion_map_reversed=hf_conversion_map_reversed,
                 target_model=target_model,
+                device_map=device_map,
             )
         except Exception as exc:
             log.debug(
@@ -782,7 +791,7 @@ class LazyTurtle:
         self,
         *,
         model_local_path: str,
-        target_model: Optional[nn.Module],
+        target_model: nn.Module | None,
     ) -> str:
         from .model import get_checkpoints
 
@@ -848,8 +857,8 @@ class LazyTurtle:
         self,
         *,
         model_local_path: str,
-        target_model: Optional[nn.Module],
-    ) -> tuple[str, Dict[str, str]]:
+        target_model: nn.Module | None,
+    ) -> tuple[str, dict[str, str]]:
         try:
             weight_map = self._load_weight_map(model_local_path)
             return model_local_path, weight_map
@@ -863,13 +872,113 @@ class LazyTurtle:
             weight_map = self._load_weight_map(tempdir)
             return tempdir, weight_map
 
+    def _parallel_preload_weights(
+        self,
+        tensor_names: Iterable[str] | None = None,
+        device_map: dict[str, str] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Pre-load requested tensors from all shards in parallel.
+
+        Groups tensors by shard file and dispatches one thread per shard,
+        opening the shard once and reading every needed tensor in a single
+        sequential pass.  This turns the current single-tensor-per-open
+        bottleneck into large sequential reads that saturate NVMe bandwidth.
+
+        When device_map is provided, tensors are loaded directly to their
+        target device (cuda:* or cpu) to reduce peak CPU memory during the
+        preload phase. This is critical for models that exceed available
+        RAM when loading everything to CPU first.
+        """
+        if tensor_names is None:
+            requested = set(self._weight_map.keys())
+        else:
+            requested = set(tensor_names)
+
+        # Group requested tensors by the shard file that owns them.
+        shard_to_names: dict[str, list[str]] = {}
+        for name in requested:
+            shard = self._weight_map.get(name)
+            if shard is None:
+                continue
+            shard_to_names.setdefault(shard, []).append(name)
+
+        if not shard_to_names:
+            return {}
+
+        preloaded: dict[str, torch.Tensor] = {}
+        max_workers = min(12, len(shard_to_names))
+        shard_items = list(shard_to_names.items())
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    self._load_shard_tensors,
+                    shard,
+                    names,
+                    device_map,
+                ): shard
+                for shard, names in shard_items
+            }
+            for future in tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc="Pre-loading shards",
+                unit="shard",
+            ):
+                shard = futures[future]
+                try:
+                    shard_tensors = future.result()
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"LazyTurtle: failed to pre-load shard {shard}: {exc}"
+                    ) from exc
+                preloaded.update(shard_tensors)
+
+        return preloaded
+
+    def _load_shard_tensors(
+        self,
+        shard: str,
+        names: list[str],
+        device_map: dict[str, str] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Open one shard and read every requested tensor in a single pass.
+
+        When device_map is provided, tensors are loaded directly to their
+        target device. For shards with tensors on multiple devices, the shard
+        is opened once per unique device to enable direct CUDA loading.
+        """
+        shard_path = os.path.join(self.model_local_path, shard)
+        result: dict[str, torch.Tensor] = {}
+
+        if device_map is None:
+            # Original behavior: load everything to CPU
+            with safe_open(shard_path, framework="pt", device="cpu") as handler:
+                for name in names:
+                    result[name] = handler.get_tensor(name)
+            return result
+
+        # Group tensor names by their target device
+        device_groups: dict[str, list[str]] = {}
+        for name in names:
+            target_device = device_map.get(name, "cpu")
+            device_groups.setdefault(target_device, []).append(name)
+
+        # Open the shard once per unique device and load tensors directly
+        for target_device, tensor_names in device_groups.items():
+            with safe_open(shard_path, framework="pt", device=target_device) as handler:
+                for name in tensor_names:
+                    result[name] = handler.get_tensor(name)
+
+        return result
+
     def checkpoint_tensors_for_submodule(
         self,
         *,
         target_model: nn.Module,
         target_submodule: nn.Module,
         recurse: bool = False,
-    ) -> Dict[str, torch.Tensor]:
+    ) -> dict[str, torch.Tensor]:
         """Load checkpoint tensors for one shell submodule without mutating it."""
 
         path = _get_qualified_name(target_model, target_submodule)
@@ -877,6 +986,7 @@ class LazyTurtle:
             return self._load_checkpoint_tensors_for_module_path(
                 module_path=path,
                 recurse=recurse,
+                device_map=self._device_map,
             )
 
     def sync_all_meta(
@@ -890,8 +1000,8 @@ class LazyTurtle:
         del require_class_match, verify_shapes
 
         materialized = 0
-        param_cache: Dict[tuple[str, torch.dtype, bool], nn.Parameter] = {}
-        buffer_cache: Dict[tuple[str, torch.dtype], torch.Tensor] = {}
+        param_cache: dict[tuple[str, torch.dtype, bool], nn.Parameter] = {}
+        buffer_cache: dict[tuple[str, torch.dtype], torch.Tensor] = {}
 
         with self._lock, torch.inference_mode():
             for qname, shell_sub in list(shell_model.named_modules()):
@@ -912,7 +1022,7 @@ class LazyTurtle:
         log.info("Module: Total direct tensors materialized from lazy checkpoint source: %s", materialized)
         return materialized
 
-    def _load_weight_map(self, model_local_path: str) -> Dict[str, str]:
+    def _load_weight_map(self, model_local_path: str) -> dict[str, str]:
         from .model import get_checkpoints
 
         is_sharded, resolved_archive_file, _ = get_checkpoints(
@@ -953,7 +1063,7 @@ class LazyTurtle:
         return []
 
     @classmethod
-    def _extract_weight_renaming_patterns(cls, entry: Any) -> Optional[tuple[str, str]]:
+    def _extract_weight_renaming_patterns(cls, entry: Any) -> tuple[str, str] | None:
         operations = getattr(entry, "operations", None)
         if operations:
             # LazyTurtle only needs reversible key renames here, not tensor ops.
@@ -968,7 +1078,7 @@ class LazyTurtle:
         return source_patterns[0], target_patterns[0]
 
     @classmethod
-    def _normalize_runtime_to_checkpoint_renamings(cls, raw_aliases: Optional[Any]) -> tuple[_LazyWeightRenaming, ...]:
+    def _normalize_runtime_to_checkpoint_renamings(cls, raw_aliases: Any | None) -> tuple[_LazyWeightRenaming, ...]:
         renamings: list[_LazyWeightRenaming] = []
         if raw_aliases is None:
             return ()
@@ -999,7 +1109,7 @@ class LazyTurtle:
         return tuple(renamings)
 
     @classmethod
-    def _iter_hf_conversion_pairs(cls, conversion_mapping: Optional[Any]) -> Iterable[tuple[str, str]]:
+    def _iter_hf_conversion_pairs(cls, conversion_mapping: Any | None) -> Iterable[tuple[str, str]]:
         if isinstance(conversion_mapping, dict):
             for checkpoint_pattern, runtime_prefix in conversion_mapping.items():
                 if isinstance(checkpoint_pattern, str) and isinstance(runtime_prefix, str):
@@ -1015,7 +1125,7 @@ class LazyTurtle:
                 yield patterns
 
     @classmethod
-    def reverse_hf_conversion_map(cls, conversion_mapping: Optional[Any]) -> Optional[list[_LazyWeightRenaming]]:
+    def reverse_hf_conversion_map(cls, conversion_mapping: Any | None) -> list[_LazyWeightRenaming] | None:
         """Invert simple HF checkpoint renames into reversed `WeightRenaming`-style rules."""
         reversed_map: list[_LazyWeightRenaming] = []
         for checkpoint_pattern, runtime_prefix in cls._iter_hf_conversion_pairs(conversion_mapping):
@@ -1024,7 +1134,7 @@ class LazyTurtle:
         return reversed_map or None
 
     @classmethod
-    def infer_hf_conversion_map_reversed(cls, *, target_model: Optional[nn.Module] = None) -> Optional[Any]:
+    def infer_hf_conversion_map_reversed(cls, *, target_model: nn.Module | None = None) -> Any | None:
         if target_model is None:
             return None
 
@@ -1076,7 +1186,7 @@ class LazyTurtle:
         return tuple(paths)
 
     @classmethod
-    def _build_moe_alias_specs(cls, module_tree: Optional[Any]) -> tuple[tuple[str, ...], tuple[_MoEAliasSpec, ...]]:
+    def _build_moe_alias_specs(cls, module_tree: Any | None) -> tuple[tuple[str, ...], tuple[_MoEAliasSpec, ...]]:
         """Extract runtime/checkpoint MoE aliases directly from the model definition's `module_tree`."""
 
         if not isinstance(module_tree, list):
@@ -1101,7 +1211,7 @@ class LazyTurtle:
                 aliases, _flags = cls._parse_module_spec(item)
                 layer_prefix.append(aliases[0])
 
-        def walk(node: Any, path: tuple[Any, ...], moe_root: Optional[tuple[tuple[str, ...], ...]]) -> None:
+        def walk(node: Any, path: tuple[Any, ...], moe_root: tuple[tuple[str, ...], ...] | None) -> None:
             if isinstance(node, dict):
                 for raw_key, value in node.items():
                     if raw_key == "#":
@@ -1121,7 +1231,7 @@ class LazyTurtle:
 
                 placeholder_index = path.index("#")
                 experts_path_aliases = tuple(path[:placeholder_index])
-                grouped: Dict[int, list[tuple[str, ...]]] = {}
+                grouped: dict[int, list[tuple[str, ...]]] = {}
                 for raw_leaf in node:
                     leaf_aliases, flags = cls._parse_module_spec(raw_leaf)
                     group_index = 0
@@ -1333,7 +1443,7 @@ class LazyTurtle:
         self,
         module_path: str,
         rel_name: str,
-    ) -> tuple[Optional[str], Optional[int], Optional[int], Optional[int]]:
+    ) -> tuple[str | None, int | None, int | None, int | None]:
         """Resolve split gate/up projection tensors against fused `gate_up_proj` checkpoint entries."""
 
         parts = rel_name.split(".")
@@ -1361,7 +1471,7 @@ class LazyTurtle:
         self,
         module_path: str,
         rel_name: str,
-    ) -> tuple[Optional[str], Optional[int], Optional[int], Optional[int]]:
+    ) -> tuple[str | None, int | None, int | None, int | None]:
         """Resolve defused expert leaf tensors against fused per-expert checkpoint tensors."""
 
         parts = rel_name.split(".")
@@ -1411,12 +1521,12 @@ class LazyTurtle:
     def _transform_checkpoint_tensor(
         tensor: torch.Tensor,
         *,
-        expert_index: Optional[int],
-        split_index: Optional[int],
-        split_dim: Optional[int],
-        expected_shape: Optional[tuple[int, ...]] = None,
-        prefer_transposed: Optional[bool] = None,
-    ) -> Optional[torch.Tensor]:
+        expert_index: int | None,
+        split_index: int | None,
+        split_dim: int | None,
+        expected_shape: tuple[int, ...] | None = None,
+        prefer_transposed: bool | None = None,
+    ) -> torch.Tensor | None:
         """Slice fused checkpoint tensors into the tensor layout expected by the shell module."""
 
         if expert_index is not None:
@@ -1484,8 +1594,8 @@ class LazyTurtle:
         target_model: nn.Module,
         module_path: str,
         rel_name: str,
-        modules_by_name: Dict[str, nn.Module],
-    ) -> Optional[bool]:
+        modules_by_name: dict[str, nn.Module],
+    ) -> bool | None:
         rel_parent, _, _leaf = rel_name.rpartition(".")
         current_path = module_path
         if rel_parent:
@@ -1506,11 +1616,135 @@ class LazyTurtle:
 
         return None
 
+    # Sentinel shard value used to identify V4 expert-merged synthetic entries.
+    _V4_MERGED_SHARD = "__v4_merged__"
+
+    def _resolve_v4_expert_merged_tensor(
+        self,
+        module_path: str,
+        rel_name: str,
+    ) -> tuple[str | None, int | None, int | None, int | None]:
+        """Merge per-expert w1/w2/w3 checkpoint tensors into fused gate_up_proj / down_proj.
+
+        Handles V4 checkpoints where the weight_map contains individual expert
+        tensors like ``layers.N.ffn.experts.M.w1.weight`` but the runtime model
+        expects a single fused ``experts.gate_up_proj.weight`` (w1+w3 stacked)
+        or ``experts.down_proj.weight`` (w2 stacked).
+        """
+        # Identify the fused projection and corresponding checkpoint component(s).
+        is_gate_up = "experts.gate_up_proj" in rel_name or "experts.gate_up_proj" in module_path
+        is_down = not is_gate_up and ("experts.down_proj" in rel_name or "experts.down_proj" in module_path)
+        if not is_gate_up and not is_down:
+            return None, None, None, None
+
+        # Determine the checkpoint prefix that precedes the per-expert entries.
+        # Try candidate module paths to find which prefix has per-expert keys in
+        # the weight_map.
+        experts_prefix = None
+        for candidate in self._candidate_module_paths(module_path, allow_empty=True):
+            for aliased in self._runtime_to_checkpoint_alias_candidates(candidate):
+                probe = f"{aliased}.experts.0.w1.weight" if is_gate_up else f"{aliased}.experts.0.w2.weight"
+                if probe in self._weight_map:
+                    experts_prefix = aliased
+                    break
+            if experts_prefix is not None:
+                break
+
+        if experts_prefix is None:
+            # Try using the combined name (direct-meta rematerialization retry path).
+            combined = self._join_tensor_name(module_path, rel_name)
+            idx = combined.find("experts.")
+            if idx < 0:
+                return None, None, None, None
+            prefix_candidate = combined[:idx].rstrip(".")
+            for cand in self._candidate_module_paths(prefix_candidate, allow_empty=True):
+                for aliased in self._runtime_to_checkpoint_alias_candidates(cand):
+                    probe = f"{aliased}.experts.0.w1.weight" if is_gate_up else f"{aliased}.experts.0.w2.weight"
+                    if probe in self._weight_map:
+                        experts_prefix = aliased
+                        break
+                if experts_prefix is not None:
+                    break
+
+        if experts_prefix is None:
+            return None, None, None, None
+
+        # Count the number of experts by probing w1 (or w2) keys.
+        n_experts = 0
+        while True:
+            key = f"{experts_prefix}.experts.{n_experts}.{'w1' if is_gate_up else 'w2'}.weight"
+            if key in self._weight_map:
+                n_experts += 1
+            else:
+                break
+        if n_experts == 0:
+            return None, None, None, None
+
+        # Synthetic key for the merged tensor.
+        proj_name = "gate_up_proj" if is_gate_up else "down_proj"
+        synthetic_key = f"{experts_prefix}.experts.{proj_name}.weight"
+
+        # Return cached result if already merged.
+        if synthetic_key in self._preloaded_tensors:
+            if synthetic_key not in self._weight_map:
+                self._weight_map[synthetic_key] = self._V4_MERGED_SHARD
+            return synthetic_key, None, None, None
+
+        # Collect all per-expert keys and group them by shard to minimize file opens.
+        shard_reads: dict[str, list[tuple[str, int]]] = {}  # shard -> [(key, expert_idx)]
+        for m in range(n_experts):
+            if is_gate_up:
+                for ckpt_component in ("w1", "w3"):
+                    key = f"{experts_prefix}.experts.{m}.{ckpt_component}.weight"
+                    shard = self._weight_map.get(key)
+                    if shard is None:
+                        return None, None, None, None
+                    shard_reads.setdefault(shard, []).append((key, m))
+            else:
+                key = f"{experts_prefix}.experts.{m}.w2.weight"
+                shard = self._weight_map.get(key)
+                if shard is None:
+                    return None, None, None, None
+                shard_reads.setdefault(shard, []).append((key, m))
+
+        # Read tensors grouped by shard, then organise per-expert.
+        if is_gate_up:
+            w1_tensors: dict[int, torch.Tensor] = {}
+            w3_tensors: dict[int, torch.Tensor] = {}
+            for shard, keys in shard_reads.items():
+                shard_path = os.path.join(self.model_local_path, shard)
+                with safe_open(shard_path, framework="pt", device="cpu") as handler:
+                    for key, expert_idx in keys:
+                        tensor = handler.get_tensor(key)
+                        if key.endswith(".w1.weight"):
+                            w1_tensors[expert_idx] = tensor
+                        else:
+                            w3_tensors[expert_idx] = tensor
+            # For each expert: cat([w1, w3], dim=0), then stack all experts.
+            merged_experts = []
+            for m in range(n_experts):
+                merged_experts.append(torch.cat([w1_tensors[m], w3_tensors[m]], dim=0))
+            merged = torch.stack(merged_experts, dim=0)  # [n_experts, 2*hidden, input]
+        else:
+            w2_tensors: dict[int, torch.Tensor] = {}
+            for shard, keys in shard_reads.items():
+                shard_path = os.path.join(self.model_local_path, shard)
+                with safe_open(shard_path, framework="pt", device="cpu") as handler:
+                    for key, expert_idx in keys:
+                        w2_tensors[expert_idx] = handler.get_tensor(key)
+            merged_experts = [w2_tensors[m] for m in range(n_experts)]
+            merged = torch.stack(merged_experts, dim=0)  # [n_experts, hidden, intermediate]
+
+        # Cache the merged tensor and register a synthetic weight_map entry.
+        self._preloaded_tensors[synthetic_key] = merged
+        self._weight_map[synthetic_key] = self._V4_MERGED_SHARD
+        return synthetic_key, None, None, None
+
     def _resolve_checkpoint_tensor_source(
         self,
         module_path: str,
         rel_name: str,
-    ) -> tuple[Optional[str], Optional[int], Optional[int], Optional[int]]:
+    ) -> tuple[str | None, int | None, int | None, int | None]:
         """Resolve a target tensor name to its checkpoint source and optional fused split index."""
 
         full_name = self._resolve_checkpoint_tensor_name(module_path, rel_name)
@@ -1533,7 +1767,18 @@ class LazyTurtle:
         if resolved[0] is not None:
             return resolved
 
-        return self._resolve_fused_expert_tensor_name("", combined_name)
+        resolved = self._resolve_fused_expert_tensor_name("", combined_name)
+        if resolved[0] is not None:
+            return resolved
+
+        # V4 expert weight merging fallback: when the runtime model expects fused
+        # gate_up_proj / down_proj but the checkpoint stores per-expert w1/w2/w3,
+        # synthesize the merged tensor from individual expert shards.
+        resolved = self._resolve_v4_expert_merged_tensor(module_path, rel_name)
+        if resolved[0] is not None:
+            return resolved
+
+        return None, None, None, None
 
     @staticmethod
     def _materialization_issue_message(
@@ -1543,12 +1788,12 @@ class LazyTurtle:
         module_path: str,
         rel_name: str,
         reason: str,
-        full_name: Optional[str] = None,
-        source_shape: Optional[tuple[int, ...]] = None,
-        target_shape: Optional[tuple[int, ...]] = None,
-        expert_index: Optional[int] = None,
-        split_index: Optional[int] = None,
-        split_dim: Optional[int] = None,
+        full_name: str | None = None,
+        source_shape: tuple[int, ...] | None = None,
+        target_shape: tuple[int, ...] | None = None,
+        expert_index: int | None = None,
+        split_index: int | None = None,
+        split_dim: int | None = None,
     ) -> str:
         """Build a consistent error message for checkpoint-backed materialization failures."""
 
@@ -1577,12 +1822,17 @@ class LazyTurtle:
         *,
         module_path: str,
         recurse: bool,
-    ) -> Dict[str, torch.Tensor]:
-        """Return raw checkpoint tensors keyed by submodule-relative names."""
+        device_map: dict[str, str] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Return raw checkpoint tensors keyed by submodule-relative names.
+
+        When device_map is provided, tensors are loaded directly to their
+        target device (cuda:* or cpu) to reduce peak CPU memory.
+        """
 
         resolved_module_path = self._resolve_checkpoint_module_path(module_path)
         prefix = f"{resolved_module_path}."
-        grouped_names: Dict[str, list[tuple[str, str]]] = {}
+        grouped_names: dict[str, list[tuple[str, str]]] = {}
         for full_name, shard in self._weight_map.items():
             if not full_name.startswith(prefix):
                 continue
@@ -1595,13 +1845,142 @@ class LazyTurtle:
 
             grouped_names.setdefault(shard, []).append((rel_name, full_name))
 
-        tensors: Dict[str, torch.Tensor] = {}
+        tensors: dict[str, torch.Tensor] = {}
         for shard, names in grouped_names.items():
-            shard_path = os.path.join(self.model_local_path, shard)
-            with safe_open(shard_path, framework="pt", device="cpu") as handler:
+            if shard == self._V4_MERGED_SHARD:
+                # V4 merged tensors should be preloaded - extract them from cache
                 for rel_name, full_name in names:
-                    tensors[rel_name] = handler.get_tensor(full_name)
+                    if full_name in self._preloaded_tensors:
+                        tensors[rel_name] = self._preloaded_tensors[full_name]
+                    else:
+                        raise RuntimeError(
+                            f"V4_MERGED_SHARD tensor '{full_name}' not found in preloaded tensors. "
+                            f"The merged tensor should always be cached by the time this code runs."
+                        )
+                continue
+            missing_names: list[tuple[str, str]] = []
+            for rel_name, full_name in names:
+                if full_name in self._preloaded_tensors:
+                    tensors[rel_name] = self._preloaded_tensors[full_name]
+                else:
+                    missing_names.append((rel_name, full_name))
+            if missing_names:
+                shard_path = os.path.join(self.model_local_path, shard)
+                # Group by target device for direct GPU loading when device_map available
+                if device_map is not None:
+                    device_groups: dict[str, list[tuple[str, str]]] = {}
+                    for rel_name, full_name in missing_names:
+                        target_device = device_map.get(full_name, "cpu")
+                        device_groups.setdefault(target_device, []).append((rel_name, full_name))
+                    for target_device, group in device_groups.items():
+                        with safe_open(shard_path, framework="pt", device=target_device) as handler:
+                            for rel_name, full_name in group:
+                                tensors[rel_name] = handler.get_tensor(full_name)
+                else:
+                    with safe_open(shard_path, framework="pt", device="cpu") as handler:
+                        for rel_name, full_name in missing_names:
+                            tensors[rel_name] = handler.get_tensor(full_name)
         return tensors
+
+    def _apply_materialized_tensor(
+        self,
+        *,
+        kind: str,
+        rel_name: str,
+        tensor: torch.Tensor,
+        target_submodule: nn.Module,
+        t_params: dict[str, nn.Parameter],
+        t_bufs: dict[str, torch.Tensor],
+        device: torch.device,
+        non_blocking: bool,
+        full_name: str,
+        expert_index: int | None,
+        split_index: int | None,
+        split_dim: int | None,
+    ) -> None:
+        """Apply a transformed checkpoint tensor to the target submodule param/buffer."""
+        if kind == "param":
+            target_param = t_params.get(rel_name)
+            if target_param is None:
+                raise RuntimeError(self._materialization_issue_message(
+                    phase="submodule materialization",
+                    kind=kind,
+                    module_path="",
+                    rel_name=rel_name,
+                    reason="target tensor disappeared before materialization",
+                    full_name=full_name,
+                    source_shape=tuple(tensor.shape),
+                    expert_index=expert_index,
+                    split_index=split_index,
+                    split_dim=split_dim,
+                ))
+            if target_param.shape != tensor.shape:
+                raise RuntimeError(self._materialization_issue_message(
+                    phase="submodule materialization",
+                    kind=kind,
+                    module_path="",
+                    rel_name=rel_name,
+                    reason="target tensor shape does not match the transformed checkpoint tensor",
+                    full_name=full_name,
+                    source_shape=tuple(tensor.shape),
+                    target_shape=tuple(target_param.shape),
+                    expert_index=expert_index,
+                    split_index=split_index,
+                    split_dim=split_dim,
+                ))
+            target_param_new = _ensure_target_storage_on_device_(target_param, device)
+            if target_param_new is not target_param:
+                t_parent, leaf = _get_parent_and_leaf_by_path(target_submodule, rel_name)
+                setattr(t_parent, leaf, target_param_new)
+                target_param = target_param_new
+            source = tensor.detach()
+            if source.dtype != target_param.dtype:
+                source = source.to(dtype=target_param.dtype)
+            target_param.detach().copy_(source, non_blocking=(non_blocking and source.is_pinned()))
+            return
+
+        target_buffer = t_bufs.get(rel_name)
+        t_parent, leaf = _get_parent_and_leaf_by_path(target_submodule, rel_name)
+        persistent = leaf not in getattr(t_parent, "_non_persistent_buffers_set", set())
+
+        source = tensor.detach()
+        if target_buffer is None:
+            new_buffer = source.to(device=device)
+            t_parent.register_buffer(leaf, new_buffer, persistent=persistent)
+            t_bufs[rel_name] = new_buffer
+            return
+
+        if tuple(target_buffer.shape) != tuple(source.shape):
+            raise RuntimeError(self._materialization_issue_message(
+                phase="submodule materialization",
+                kind=kind,
+                module_path="",
+                rel_name=rel_name,
+                reason="target tensor shape does not match the transformed checkpoint tensor",
+                full_name=full_name,
+                source_shape=tuple(source.shape),
+                target_shape=tuple(target_buffer.shape),
+                expert_index=expert_index,
+                split_index=split_index,
+                split_dim=split_dim,
+            ))
+
+        if getattr(target_buffer, "is_meta", False) or target_buffer.device.type == "meta":
+            new_buffer = torch.empty_like(target_buffer, device=device)
+            new_buffer.copy_(source.to(dtype=new_buffer.dtype), non_blocking=(non_blocking and source.is_pinned()))
+            t_parent.register_buffer(leaf, new_buffer, persistent=persistent)
+            t_bufs[rel_name] = new_buffer
+            return
+
+        if target_buffer.device != device:
+            new_buffer = torch.empty_like(target_buffer, device=device)
+            new_buffer.copy_(source.to(dtype=new_buffer.dtype), non_blocking=(non_blocking and source.is_pinned()))
+            t_parent.register_buffer(leaf, new_buffer, persistent=persistent)
+            t_bufs[rel_name] = new_buffer
+        else:
+            if source.dtype != target_buffer.dtype:
+                source = source.to(dtype=target_buffer.dtype)
+            target_buffer.copy_(source, non_blocking=(non_blocking and source.is_pinned()))
 
     def _copy_checkpoint_tensors_into_submodule(
         self,
@@ -1620,7 +1999,7 @@ class LazyTurtle:
         modules_by_name = dict(target_model.named_modules())
         missing_nonpersistent_buffers: list[tuple[str, str]] = []
 
-        grouped_names: Dict[str, list[tuple[str, str, str, Optional[int], Optional[int], Optional[int]]]] = {}
+        grouped_names: dict[str, list[tuple[str, str, str, int | None, int | None, int | None]]] = {}
         for rel_name in t_params:
             full_name, expert_index, split_index, split_dim = self._resolve_checkpoint_tensor_source(module_path, rel_name)
             if full_name is None:
@@ -1670,9 +2049,10 @@ class LazyTurtle:
 
         with torch.inference_mode():
             for shard, entries in grouped_names.items():
-                shard_path = os.path.join(self.model_local_path, shard)
-                with safe_open(shard_path, framework="pt", device="cpu") as handler:
-                    for kind, rel_name, full_name, expert_index, split_index, split_dim in entries:
+                missing_entries = []
+                for entry in entries:
+                    kind, rel_name, full_name, expert_index, split_index, split_dim = entry
+                    if full_name in self._preloaded_tensors:
                         target_tensor = t_params.get(rel_name) if kind == "param" else t_bufs.get(rel_name)
                         expected_shape = tuple(target_tensor.shape) if target_tensor is not None else None
                         prefer_transposed = self._resolve_prefer_transposed_hint(
@@ -1681,7 +2061,7 @@ class LazyTurtle:
                             rel_name=rel_name,
                             modules_by_name=modules_by_name,
                         )
-                        checkpoint_tensor = handler.get_tensor(full_name)
+                        checkpoint_tensor = self._preloaded_tensors[full_name]
                         tensor = self._transform_checkpoint_tensor(
                             checkpoint_tensor,
                             expert_index=expert_index,
@@ -1704,88 +2084,77 @@ class LazyTurtle:
                                 split_index=split_index,
                                 split_dim=split_dim,
                             ))
-                        if kind == "param":
-                            target_param = t_params.get(rel_name)
-                            if target_param is None:
-                                raise RuntimeError(self._materialization_issue_message(
-                                    phase="submodule materialization",
-                                    kind=kind,
-                                    module_path=module_path,
-                                    rel_name=rel_name,
-                                    reason="target tensor disappeared before materialization",
-                                    full_name=full_name,
-                                    source_shape=tuple(tensor.shape),
-                                    expert_index=expert_index,
-                                    split_index=split_index,
-                                    split_dim=split_dim,
-                                ))
-                            if target_param.shape != tensor.shape:
-                                raise RuntimeError(self._materialization_issue_message(
-                                    phase="submodule materialization",
-                                    kind=kind,
-                                    module_path=module_path,
-                                    rel_name=rel_name,
-                                    reason="target tensor shape does not match the transformed checkpoint tensor",
-                                    full_name=full_name,
-                                    source_shape=tuple(tensor.shape),
-                                    target_shape=tuple(target_param.shape),
-                                    expert_index=expert_index,
-                                    split_index=split_index,
-                                    split_dim=split_dim,
-                                ))
-                            target_param_new = _ensure_target_storage_on_device_(target_param, device)
-                            if target_param_new is not target_param:
-                                t_parent, leaf = _get_parent_and_leaf_by_path(target_submodule, rel_name)
-                                setattr(t_parent, leaf, target_param_new)
-                                target_param = target_param_new
-                            source = tensor.detach()
-                            if source.dtype != target_param.dtype:
-                                source = source.to(dtype=target_param.dtype)
-                            target_param.detach().copy_(source, non_blocking=(non_blocking and source.is_pinned()))
-                            continue
-
-                        target_buffer = t_bufs.get(rel_name)
-                        t_parent, leaf = _get_parent_and_leaf_by_path(target_submodule, rel_name)
-                        persistent = leaf not in getattr(t_parent, "_non_persistent_buffers_set", set())
-
-                        source = tensor.detach()
-                        if target_buffer is None:
-                            new_buffer = source.to(device=device)
-                            t_parent.register_buffer(leaf, new_buffer, persistent=persistent)
-                            t_bufs[rel_name] = new_buffer
-                            continue
-
-                        if tuple(target_buffer.shape) != tuple(source.shape):
-                            raise RuntimeError(self._materialization_issue_message(
-                                phase="submodule materialization",
-                                kind=kind,
+                        self._apply_materialized_tensor(
+                            kind=kind,
+                            rel_name=rel_name,
+                            tensor=tensor,
+                            target_submodule=target_submodule,
+                            t_params=t_params,
+                            t_bufs=t_bufs,
+                            device=device,
+                            non_blocking=non_blocking,
+                            full_name=full_name,
+                            expert_index=expert_index,
+                            split_index=split_index,
+                            split_dim=split_dim,
+                        )
+                    else:
+                        missing_entries.append(entry)
+                if missing_entries:
+                    if shard == self._V4_MERGED_SHARD:
+                        missing_names = [entry[2] for entry in missing_entries]
+                        raise RuntimeError(
+                            f"V4 merged expert tensors were expected in the preloaded cache but were missing. "
+                            f"Missing tensor names: {missing_names}"
+                        )
+                    shard_path = os.path.join(self.model_local_path, shard)
+                    with safe_open(shard_path, framework="pt", device="cpu") as handler:
+                        for kind, rel_name, full_name, expert_index, split_index, split_dim in missing_entries:
+                            target_tensor = t_params.get(rel_name) if kind == "param" else t_bufs.get(rel_name)
+                            expected_shape = tuple(target_tensor.shape) if target_tensor is not None else None
+                            prefer_transposed = self._resolve_prefer_transposed_hint(
+                                target_model=target_model,
                                 module_path=module_path,
                                 rel_name=rel_name,
-                                reason="target tensor shape does not match the transformed checkpoint tensor",
-                                full_name=full_name,
-                                source_shape=tuple(source.shape),
-                                target_shape=tuple(target_buffer.shape),
+                                modules_by_name=modules_by_name,
+                            )
+                            checkpoint_tensor = handler.get_tensor(full_name)
+                            tensor = self._transform_checkpoint_tensor(
+                                checkpoint_tensor,
                                 expert_index=expert_index,
                                 split_index=split_index,
                                 split_dim=split_dim,
-                            ))
-
-                        if getattr(target_buffer, "is_meta", False) or target_buffer.device.type == "meta":
-                            new_buffer = torch.empty_like(target_buffer, device=device)
-                            new_buffer.copy_(source.to(dtype=new_buffer.dtype), non_blocking=(non_blocking and source.is_pinned()))
-                            t_parent.register_buffer(leaf, new_buffer, persistent=persistent)
-                            t_bufs[rel_name] = new_buffer
-                            continue
-
-                        if target_buffer.device != device:
-                            new_buffer = torch.empty_like(target_buffer, device=device)
-                            new_buffer.copy_(source.to(dtype=new_buffer.dtype), non_blocking=(non_blocking and source.is_pinned()))
-                            t_parent.register_buffer(leaf, new_buffer, persistent=persistent)
-                            t_bufs[rel_name] = new_buffer
-                        else:
-                            if source.dtype != target_buffer.dtype:
-                                source = source.to(dtype=target_buffer.dtype)
-                            target_buffer.copy_(source, non_blocking=(non_blocking and source.is_pinned()))
+                                expected_shape=expected_shape,
+                                prefer_transposed=prefer_transposed,
+                            )
+                            if tensor is None:
+                                raise RuntimeError(self._materialization_issue_message(
+                                    phase="submodule materialization",
+                                    kind=kind,
+                                    module_path=module_path,
+                                    rel_name=rel_name,
+                                    reason="checkpoint tensor could not be reshaped into the target layout",
+                                    full_name=full_name,
+                                    source_shape=tuple(checkpoint_tensor.shape),
+                                    target_shape=expected_shape,
+                                    expert_index=expert_index,
+                                    split_index=split_index,
+                                    split_dim=split_dim,
+                                ))
+                            self._apply_materialized_tensor(
+                                kind=kind,
+                                rel_name=rel_name,
+                                tensor=tensor,
+                                target_submodule=target_submodule,
+                                t_params=t_params,
+                                t_bufs=t_bufs,
+                                device=device,
+                                non_blocking=non_blocking,
+                                full_name=full_name,
+                                expert_index=expert_index,
+                                split_index=split_index,
+                                split_dim=split_dim,
+                            )
 
         self._restore_missing_nonpersistent_buffers(
             target_model=target_model,
@@ -1800,7 +2169,7 @@ class LazyTurtle:
         *,
         owner_module: nn.Module,
         target_model: nn.Module,
-    ) -> Optional[nn.Module]:
+    ) -> nn.Module | None:
         """Construct a CPU template module for init-only buffers missing from checkpoint shards."""
 
         config_source = getattr(owner_module, "config", None)
@@ -1869,13 +2238,13 @@ class LazyTurtle:
         *,
         target_model: nn.Module,
         target_submodule: nn.Module,
-        t_bufs: Dict[str, torch.Tensor],
+        t_bufs: dict[str, torch.Tensor],
         missing_nonpersistent_buffers: list[tuple[str, str]],
         device: torch.device,
     ) -> None:
         """Restore constructor-owned buffers that are intentionally absent from checkpoints."""
 
-        owner_templates: Dict[str, Optional[nn.Module]] = {}
+        owner_templates: dict[str, nn.Module | None] = {}
         for rel_name, leaf in missing_nonpersistent_buffers:
             parent_rel_path, _, _ = rel_name.rpartition(".")
             owner_module = target_submodule if not parent_rel_path else dict(target_submodule.named_modules()).get(parent_rel_path)
@@ -1913,8 +2282,8 @@ class LazyTurtle:
         *,
         shell_sub: nn.Module,
         module_path: str,
-        param_cache: Dict[tuple[str, Optional[int], Optional[int], Optional[int], torch.dtype, bool], nn.Parameter],
-        buffer_cache: Dict[tuple[str, Optional[int], Optional[int], Optional[int], torch.dtype], torch.Tensor],
+        param_cache: dict[tuple[str, int | None, int | None, int | None, torch.dtype, bool], nn.Parameter],
+        buffer_cache: dict[tuple[str, int | None, int | None, int | None, torch.dtype], torch.Tensor],
     ) -> int:
         synced = 0
 
@@ -1941,9 +2310,12 @@ class LazyTurtle:
                         split_dim=split_dim,
                     ))
 
-                source_path = os.path.join(self.model_local_path, shard)
-                with safe_open(source_path, framework="pt", device="cpu") as handler:
-                    checkpoint_param = handler.get_tensor(full_name)
+                if full_name in self._preloaded_tensors:
+                    checkpoint_param = self._preloaded_tensors[full_name]
+                else:
+                    source_path = os.path.join(self.model_local_path, shard)
+                    with safe_open(source_path, framework="pt", device="cpu") as handler:
+                        checkpoint_param = handler.get_tensor(full_name)
                 source_param = self._transform_checkpoint_tensor(
                     checkpoint_param,
                     expert_index=expert_index,
@@ -2018,9 +2390,12 @@ class LazyTurtle:
                         split_dim=split_dim,
                     ))
 
-                source_path = os.path.join(self.model_local_path, shard)
-                with safe_open(source_path, framework="pt", device="cpu") as handler:
-                    checkpoint_buffer = handler.get_tensor(full_name)
+                if full_name in self._preloaded_tensors:
+                    checkpoint_buffer = self._preloaded_tensors[full_name]
+                else:
+                    source_path = os.path.join(self.model_local_path, shard)
+                    with safe_open(source_path, framework="pt", device="cpu") as handler:
+                        checkpoint_buffer = handler.get_tensor(full_name)
                 source_buffer = self._transform_checkpoint_tensor(
                     checkpoint_buffer,
                     expert_index=expert_index,

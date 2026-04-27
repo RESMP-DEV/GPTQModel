@@ -10,7 +10,6 @@ import os
 import time
 from importlib.metadata import PackageNotFoundError, version
 from itertools import chain
-from typing import Dict, List, Optional, Union
 
 import numpy as np
 import torch
@@ -18,7 +17,6 @@ import transformers
 
 from ..utils.modelscope import ensure_modelscope_available
 from ..utils.structure import LazyTurtle, print_module_tree
-
 
 if ensure_modelscope_available():
     from modelscope import snapshot_download
@@ -40,43 +38,21 @@ from ..quantization.config import FORMAT, METHOD, MIN_VERSION_WITH_V2, BaseQuant
 from ..utils import internal_gguf
 from ..utils.backend import BACKEND, PROFILE, normalize_backend, normalize_profile
 from ..utils.exllamav3 import replace_exllamav3_placeholders
-from ..utils.hf import (
-    INTERNAL_HF_GGUF_FILE_KWARG,
-    get_hf_config_dtype,
-    get_hf_gguf_load_kwargs,
-    has_native_transformers_causallm_support,
-    normalize_hf_config_compat,
-    normalize_model_id_or_path_for_hf_gguf,
-    normalize_torch_dtype_kwarg,
-    prepare_remote_model_init_compat,
-    resolve_trust_remote_code,
-    set_hf_config_dtype,
-    suspend_hf_weight_init,
-)
-from ..utils.importer import (
-    auto_select_device,
-    get_kernel_for_backend,
-    normalize_device_device_map,
-    select_quant_linear,
-)
+from ..utils.hf import (INTERNAL_HF_GGUF_FILE_KWARG, get_hf_config_dtype, get_hf_gguf_load_kwargs,
+                        has_native_transformers_causallm_support, normalize_hf_config_compat,
+                        normalize_model_id_or_path_for_hf_gguf, normalize_torch_dtype_kwarg,
+                        prepare_remote_model_init_compat, resolve_trust_remote_code,
+                        set_hf_config_dtype, suspend_hf_weight_init)
+from ..utils.importer import (auto_select_device, get_kernel_for_backend,
+                              normalize_device_device_map, select_quant_linear)
 from ..utils.inspect import safe_kwargs_call
 from ..utils.logger import setup_logger
 from ..utils.machete import _validate_machete_device_support
 from ..utils.marlin import _marlin_capability_supported, _validate_marlin_device_support
-from ..utils.model import (
-    auto_dtype,
-    convert_gptq_v1_to_v2_format,
-    find_config_seq_len,
-    find_modules,
-    get_checkpoints,
-    get_module_by_name_prefix,
-    gptqmodel_post_init,
-    load_checkpoint_in_model_then_tie_weights,
-    make_quant,
-    simple_dispatch_model,
-)
+from ..utils.model import (auto_dtype, convert_gptq_v1_to_v2_format, find_config_seq_len, find_modules,
+                           get_checkpoints, get_module_by_name_prefix, gptqmodel_post_init,
+                           load_checkpoint_in_model_then_tie_weights, make_quant, simple_dispatch_model)
 from ._const import DEVICE, normalize_device
-
 
 log = setup_logger()
 
@@ -130,7 +106,7 @@ def _is_accelerated_attention_device(device: object) -> bool:
 
 def _resolve_native_gguf_profile(
     *,
-    native_gguf_qspec: Optional["internal_gguf.GGUFQuantizedCheckpointSpec"],
+    native_gguf_qspec: internal_gguf.GGUFQuantizedCheckpointSpec | None,
     profile: PROFILE,
 ) -> PROFILE:
     """Resolve user profile intent for native GGUF checkpoints."""
@@ -147,7 +123,7 @@ def _resolve_native_gguf_profile(
 
 def _should_use_dense_native_gguf_path(
     *,
-    native_gguf_qspec: Optional["internal_gguf.GGUFQuantizedCheckpointSpec"],
+    native_gguf_qspec: internal_gguf.GGUFQuantizedCheckpointSpec | None,
     profile: PROFILE,
 ) -> bool:
     """Fast Bonsai mode stays on the dense HF GGUF import path."""
@@ -219,7 +195,7 @@ def _coerce_quantized_awq_dtype(*, backend: BACKEND, qcfg: QuantizeConfig, dtype
     return torch.float16
 
 
-def check_versions(model_class, requirements: List[str]):
+def check_versions(model_class, requirements: list[str]):
     if requirements is None:
         return
     for req in requirements:
@@ -262,11 +238,11 @@ def get_model_local_path(pretrained_model_id_or_path, **kwargs):
     )
 
 
-def _get_tokenizer_load_kwargs(model_init_kwargs: Dict) -> Dict:
+def _get_tokenizer_load_kwargs(model_init_kwargs: dict) -> dict:
     return get_hf_gguf_load_kwargs(model_init_kwargs)
 
 
-def _resolve_local_gguf_checkpoint_path(model_local_path: str, hf_gguf_load_kwargs: Dict[str, str]) -> Optional[str]:
+def _resolve_local_gguf_checkpoint_path(model_local_path: str, hf_gguf_load_kwargs: dict[str, str]) -> str | None:
     gguf_file = hf_gguf_load_kwargs.get("gguf_file")
     if not gguf_file:
         return None
@@ -279,8 +255,8 @@ def _resolve_local_gguf_checkpoint_path(model_local_path: str, hf_gguf_load_kwar
 
 def _resolve_native_quantized_gguf_checkpoint(
     model_local_path: str,
-    hf_gguf_load_kwargs: Dict[str, str],
-) -> tuple[Optional[str], Optional[internal_gguf.GGUFQuantizedCheckpointSpec]]:
+    hf_gguf_load_kwargs: dict[str, str],
+) -> tuple[str | None, internal_gguf.GGUFQuantizedCheckpointSpec | None]:
     if not internal_gguf.native_quantized_loader_enabled():
         return None, None
 
@@ -413,12 +389,12 @@ def ModelLoader(cls):
             cls,
             pretrained_model_id_or_path: str,
             quantize_config: BaseQuantizeConfig,
-            backend: Union[str, BACKEND] = BACKEND.AUTO,
-            profile: Union[str, int, PROFILE] = PROFILE.AUTO,
+            backend: str | BACKEND = BACKEND.AUTO,
+            profile: str | int | PROFILE = PROFILE.AUTO,
             trust_remote_code: bool = False,
             dtype: [str | torch.dtype] = "auto",
-            device_map: Optional[Union[str, Dict[str, Union[int, str]]]] = None,
-            device: Optional[Union[str, int]] = None,
+            device_map: str | dict[str, int | str] | None = None,
+            device: str | int | None = None,
             **model_init_kwargs,
     ):
         # quantization is unsafe with GIL=0 and torch.compile/graphs
@@ -661,6 +637,7 @@ def ModelLoader(cls):
                         cls.resolve_hf_conversion_map_reversed(target_model=model)
                     ),
                     target_model=model,
+                    device_map=getattr(model, "hf_device_map", None),
                 )
 
                 if turtle_model is None:
@@ -724,11 +701,11 @@ def ModelLoader(cls):
     @classmethod
     def from_quantized(
             cls,
-            model_id_or_path: Optional[str],
-            device_map: Optional[Union[str, Dict[str, Union[int, str]]]] = None,
-            device: Optional[Union[str, int]] = None,
-            backend: Union[str, BACKEND] = BACKEND.AUTO,
-            adapter: Optional[Adapter] = None,
+            model_id_or_path: str | None,
+            device_map: str | dict[str, int | str] | None = None,
+            device: str | int | None = None,
+            backend: str | BACKEND = BACKEND.AUTO,
+            adapter: Adapter | None = None,
             dtype: [str | torch.dtype] = "auto",
             trust_remote_code: bool = False,
             **kwargs,
@@ -1125,10 +1102,10 @@ def ModelLoader(cls):
         def build_layerwise_device_map(
                 model,
                 device,
-                layers: List[torch.nn.Module],
-                ignore_modules: List[torch.nn.Module],
-                num_gpus: Optional[int] = None,
-        ) -> Dict[str, str]:
+                layers: list[torch.nn.Module],
+                ignore_modules: list[torch.nn.Module],
+                num_gpus: int | None = None,
+        ) -> dict[str, str]:
             """
             Build a deterministic alternating device_map for multi-GPU loading.
             Designed for quantized GPTQ models.
@@ -1148,7 +1125,7 @@ def ModelLoader(cls):
                 raise RuntimeError("No CUDA devices detected")
 
             device_ids = list(range(num_gpus))
-            device_map: Dict[str, str] = {}
+            device_map: dict[str, str] = {}
             mod2name = {m: n for n, m in model.named_modules()}
 
             if device == DEVICE.CUDA:
@@ -1183,7 +1160,7 @@ def ModelLoader(cls):
             assign(in_emb, device_ids[0])
 
             # Alternating layers
-            layer_name2devid: Dict[str, int] = {}
+            layer_name2devid: dict[str, int] = {}
 
             for i, layer in enumerate(layers):
                 gpu = device_ids[i % num_gpus]
