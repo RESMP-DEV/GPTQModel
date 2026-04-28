@@ -9,7 +9,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-from device_smi import Device
+import ctypes
+import resource
+
 import torch
 from torch import Tensor
 from torch.nn import Module
@@ -26,7 +28,7 @@ from ..models.writer import (PROCESS_LOG_FWD_TIME, PROCESS_LOG_LAYER, PROCESS_LO
 from ..quantization.config import QuantizeConfig
 from ..utils.colors import ANSIColor, color_text
 from ..utils.logger import setup_logger
-from ..utils.torch import CPU, DEVICE_0, DEVICE_1, HAS_NPU
+from ..utils.torch import CPU, DEVICE_0, DEVICE_1
 
 log = setup_logger()
 
@@ -139,9 +141,8 @@ class LoopProcessor:
         self._log_header_interval = 20
         current_time = datetime.now().strftime("%m_%d_%Y_%Hh_%Mm_%Ss")
         self.log_tmp_log_file_name = f"{self.name()}_log_{get_random_string()}_time_{current_time}.log"
-        self._device_smi_handles = self._init_device_smi_handles()
-        self._cpu_device_smi = self._init_cpu_device_handle()
-        self._device_metric_failures: Set[str] = set()
+        self._nvml_lib = self._init_nvml()
+        self._nvml_handles = self._init_nvml_handles()
 
 
         # prepare dataset
@@ -479,102 +480,59 @@ class LoopProcessor:
 
         return dtype_alias.get(dtype_str, dtype_str)
 
-    def _init_device_smi_handles(self) -> Dict[str, Device]:
-        """Creates Device-SMI handles for all discovered accelerator devices."""
+    # -- NVML-based GPU memory monitoring --
+    # Replaces device_smi which spawns nvidia-smi subprocesses per query per GPU.
+    # On multi-GPU MoE quantization this caused thousands of process spawns.
 
-        handles: Dict[str, Device] = {}
+    class _NvmlMemoryInfo(ctypes.Structure):
+        _fields_ = [("total", ctypes.c_ulonglong),
+                     ("free", ctypes.c_ulonglong),
+                     ("used", ctypes.c_ulonglong)]
 
-        for device_id in self._discover_accelerator_devices():
+    @staticmethod
+    def _init_nvml() -> Optional[ctypes.CDLL]:
+        for lib_name in ("libnvidia-ml.so.1", "libnvidia-ml.so"):
             try:
-                handles[device_id] = Device(device_id)
-            except Exception as exc:  # pragma: no cover - defensive, external tool
-                log.debug(f"Device-SMI initialisation failed for `{device_id}`: {exc}")
+                lib = ctypes.CDLL(lib_name)
+                if lib.nvmlInit_v2() == 0:
+                    return lib
+            except OSError:
+                continue
+        log.debug("NVML not available, GPU memory reporting disabled")
+        return None
 
+    def _init_nvml_handles(self) -> Dict[str, ctypes.c_void_p]:
+        if self._nvml_lib is None:
+            return {}
+        count = ctypes.c_uint()
+        if self._nvml_lib.nvmlDeviceGetCount_v2(ctypes.byref(count)) != 0:
+            return {}
+        handles: Dict[str, ctypes.c_void_p] = {}
+        for i in range(count.value):
+            handle = ctypes.c_void_p()
+            if self._nvml_lib.nvmlDeviceGetHandleByIndex_v2(i, ctypes.byref(handle)) == 0:
+                handles[f"cuda:{i}"] = handle
         return handles
 
-    def _init_cpu_device_handle(self) -> Optional[Device]:
-        """Creates the optional Device-SMI handle used for CPU memory tracking."""
-
-        try:
-            return Device("cpu")
-        except Exception as exc:  # pragma: no cover - defensive, external tool
-            log.debug(f"Device-SMI CPU initialisation failed: {exc}")
-            return None
-
-    def _discover_accelerator_devices(self) -> List[str]:
-        """Lists CUDA/ROCm/XPU device identifiers visible to the runtime."""
-
-        devices: List[str] = []
-
-        if hasattr(torch, "cuda"):
-            try:
-                if torch.cuda.is_available():
-                    device_type = "rocm" if getattr(torch.version, "hip", None) else "cuda"
-                    for idx in range(torch.cuda.device_count()):
-                        devices.append(f"{device_type}:{idx}")
-            except Exception:  # pragma: no cover - defensive, CUDA runtime differences
-                pass
-
-        xpu = getattr(torch, "xpu", None)
-        if xpu is not None:
-            try:
-                if torch.xpu.is_available():
-                    for idx in range(torch.xpu.device_count()):
-                        devices.append(f"xpu:{idx}")
-            except Exception:  # pragma: no cover - defensive, XPU runtime differences
-                pass
-
-        if HAS_NPU:
-            try:
-                for idx in range(torch.npu.device_count()):
-                    devices.append(f"npu:{idx}")
-            except Exception:  # pragma: no cover - defensive, NPU runtime differences
-                pass
-
-        return devices
-
-    def _safe_query_metric(self, device_key: str, handle: Device):
-        """Queries Device-SMI metrics once per device, suppressing repeated failures."""
-
-        try:
-            return handle.metrics(fast=True)
-        except Exception as exc:  # pragma: no cover - defensive, external tool
-            if device_key not in self._device_metric_failures:
-                log.debug(f"Device-SMI metrics failed for `{device_key}`: {exc}")
-                self._device_metric_failures.add(device_key)
-            return None
-
     def _snapshot_device_memory_gib(self) -> Dict[str, float]:
-        """Captures current accelerator memory usage in GiB per device."""
-
         snapshot: Dict[str, float] = {}
-        for device_id, handle in self._device_smi_handles.items():
-            metrics = self._safe_query_metric(device_id, handle)
-            if metrics is None:
-                continue
-            snapshot[device_id] = metrics.memory_used / (1024 ** 3)
+        if self._nvml_lib is None:
+            return snapshot
+        for device_id, handle in self._nvml_handles.items():
+            mem = self._NvmlMemoryInfo()
+            if self._nvml_lib.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(mem)) == 0:
+                snapshot[device_id] = mem.used / (1024 ** 3)
         return snapshot
 
     def _snapshot_cpu_memory_gib(self) -> Optional[float]:
-        """Captures current CPU memory usage in GiB when supported."""
-
-        if self._cpu_device_smi is None:
-            return None
-        metrics = self._safe_query_metric("cpu", self._cpu_device_smi)
-        if metrics is None:
-            return None
-        return metrics.memory_used / (1024 ** 3)
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024)
 
     def device_memory_report(self) -> str:
-        """Formats current accelerator memory usage for processor log rows."""
-
         snapshot = self._snapshot_device_memory_gib()
         if not snapshot:
             return "n/a"
 
         def _format_gib(value: float) -> str:
-            """Formats a GiB value without unnecessary trailing zeros."""
-
             text = f"{value:.2f}"
             if text.endswith("00"):
                 text = text[:-2]
@@ -593,8 +551,6 @@ class LoopProcessor:
                 continue
 
             def sort_key(item: Tuple[str, float, int]) -> Tuple[int, int]:
-                """Sorts indexed devices numerically while preserving fallback order."""
-
                 index, _, order = item
                 try:
                     return 0, int(index)
@@ -607,22 +563,14 @@ class LoopProcessor:
 
         return " | ".join(segments)
 
-    def _close_device_smi_handles(self) -> None:
-        """Closes all Device-SMI handles owned by this processor."""
-
-        for handle in self._device_smi_handles.values():
+    def _nvml_shutdown(self) -> None:
+        if self._nvml_lib is not None:
             try:
-                handle.close()
+                self._nvml_lib.nvmlShutdown()
             except Exception:
                 pass
-        self._device_smi_handles.clear()
-
-        if self._cpu_device_smi is not None:
-            try:
-                self._cpu_device_smi.close()
-            except Exception:
-                pass
-            self._cpu_device_smi = None
+            self._nvml_lib = None
+        self._nvml_handles.clear()
 
     # Loop Procssor level scoped state data
     def result_save(self, key: str, value: Any):
@@ -768,7 +716,7 @@ class LoopProcessor:
     def finalize(self, model: BaseQModel, **kwargs):
         """Releases shared processor resources after the full quantization loop."""
 
-        self._close_device_smi_handles()
+        self._nvml_shutdown()
         del self.inputs_cache
         del self._results
 
