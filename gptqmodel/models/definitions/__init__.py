@@ -46,6 +46,7 @@ from .internlm2 import InternLM2QModel
 from .internvl_chat import InternVLChatQModel
 from .llama4 import Llama4QModel
 from .mimo import MimoQModel
+from .mimo_v2 import MiMoV2QModel
 from .minicpm3 import MiniCpm3QModel
 from .minicpm_o import MiniCPMOQModel
 from .minicpm_v import MiniCPMVQModel
