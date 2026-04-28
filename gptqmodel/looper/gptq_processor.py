@@ -41,6 +41,14 @@ def clone_gptq_config_for_module(
     if qcfg.dynamic_get(layer_name=module_full_name) == False:
         return None
 
+    # Fast path: when no dynamic overrides exist, a shallow copy suffices
+    # because the downstream consumer only reads scalar fields. This avoids
+    # the extremely expensive copy.deepcopy() call (~11,000 times for V4-Flash).
+    if qcfg.dynamic is None:
+        qcfg_clone = copy.copy(qcfg)
+        qcfg_clone.fallback = normalize_fallback(fallback, qcfg_clone.fallback)
+        return qcfg_clone
+
     qcfg_clone = copy.deepcopy(qcfg)
 
     # dynamic overrides
@@ -199,6 +207,7 @@ class GPTQProcessor(LoopProcessor):
                 for sample_index, sample_keep in enumerate(keep_mask):
                     if not bool(sample_keep.any().item()):
                         continue
+                    sample_keep = sample_keep.to(inp_tensor.device)
 
                     sample_inp = inp_tensor[sample_index : sample_index + 1, sample_keep, :].contiguous()
                     if out_tensor is not None and out_tensor.dim() >= 3 and out_tensor.shape[:2] == inp_tensor.shape[:2]:

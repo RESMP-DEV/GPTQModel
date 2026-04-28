@@ -638,6 +638,7 @@ def ModelLoader(cls):
                     ),
                     target_model=model,
                     device_map=getattr(model, "hf_device_map", None),
+                    preload_weights=not quantize_config.offload_to_disk,
                 )
 
                 if turtle_model is None:

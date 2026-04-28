@@ -1686,6 +1686,17 @@ def _validate_unique_preprocessors(preprocessors: List[BasePreProcessorConfig]) 
         codes_seen.add(preprocessor.code)
 
 
+_DYNAMIC_PCRE_CACHE: Dict[str, "pcre.Pattern"] = {}
+
+def _get_compiled_pcre(pattern: str) -> "pcre.Pattern":
+    """Return a cached compiled PCRE pattern, compiling on first use."""
+    compiled = _DYNAMIC_PCRE_CACHE.get(pattern)
+    if compiled is None:
+        compiled = pcre.compile(pattern)
+        _DYNAMIC_PCRE_CACHE[pattern] = compiled
+    return compiled
+
+
 def dynamic_get(dynamic: Dict[str, Dict[str, Union[int, bool]]], module_name: str, key: str = None,
                 default: Union[int, bool] = None, sub_key: str = None) -> Union[Dict, int, bool]:
 
@@ -1694,9 +1705,9 @@ def dynamic_get(dynamic: Dict[str, Dict[str, Union[int, bool]]], module_name: st
 
     for pattern, overrides in dynamic.items():
         if pattern.startswith("-:"):
-            if pcre.compile(pattern.removeprefix("-:")).match(module_name):
+            if _get_compiled_pcre(pattern.removeprefix("-:")).match(module_name):
                 return False
-        elif pcre.compile(pattern.removeprefix("+:")).match(module_name):
+        elif _get_compiled_pcre(pattern.removeprefix("+:")).match(module_name):
             if key is None:
                 return overrides
             else:

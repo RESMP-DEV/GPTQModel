@@ -705,6 +705,7 @@ class LazyTurtle:
         hf_conversion_map_reversed: Any | None = None,
         target_model: nn.Module | None = None,
         device_map: dict[str, str] | None = None,
+        preload_weights: bool = True,
     ) -> None:
         self.config = copy.deepcopy(config)
         self._model_init_kwargs = dict(model_init_kwargs or {})
@@ -725,9 +726,16 @@ class LazyTurtle:
         self._runtime_to_checkpoint_renamings = tuple(alias_items)
         self._device_map = device_map
         self._lock = threading.RLock()
-        self._preloaded_tensors: dict[str, torch.Tensor] = self._parallel_preload_weights(
-            device_map=device_map,
-        )
+        if preload_weights:
+            self._preloaded_tensors: dict[str, torch.Tensor] = self._parallel_preload_weights(
+                device_map=device_map,
+            )
+        else:
+            non_expert_names = [k for k in self._weight_map if ".experts." not in k]
+            self._preloaded_tensors: dict[str, torch.Tensor] = self._parallel_preload_weights(
+                tensor_names=non_expert_names,
+                device_map=device_map,
+            )
 
     @classmethod
     def maybe_create(
@@ -740,6 +748,7 @@ class LazyTurtle:
         hf_conversion_map_reversed: Any | None = None,
         target_model: nn.Module | None = None,
         device_map: dict[str, str] | None = None,
+        preload_weights: bool = True,
     ) -> Optional["LazyTurtle"]:
         if not model_local_path or not os.path.isdir(model_local_path):
             return None
@@ -753,6 +762,7 @@ class LazyTurtle:
                 hf_conversion_map_reversed=hf_conversion_map_reversed,
                 target_model=target_model,
                 device_map=device_map,
+                preload_weights=preload_weights,
             )
         except Exception as exc:
             log.debug(
@@ -1414,6 +1424,18 @@ class LazyTurtle:
             prefix = f"{candidate}."
             if any(full_name.startswith(prefix) for full_name in self._weight_map):
                 return candidate
+
+        # Fallback: probe with common tensor suffixes through the renaming rules
+        # to discover the checkpoint module prefix. Handles cases like
+        # model.embed_tokens -> embed where only tensor-level rules exist.
+        for suffix in (".weight", ".bias"):
+            probe = f"{module_path}{suffix}"
+            for renamed in self._runtime_to_checkpoint_alias_candidates(probe):
+                if renamed in self._weight_map and renamed.endswith(suffix):
+                    resolved = renamed[: -len(suffix)]
+                    if resolved:
+                        return resolved
+
         return module_path
 
     def _resolve_checkpoint_tensor_name(self, module_path: str, rel_name: str) -> str:
@@ -1428,6 +1450,10 @@ class LazyTurtle:
                 if candidate_name not in seen:
                     seen.add(candidate_name)
                     candidates.append(candidate_name)
+                for renamed_name in self._runtime_to_checkpoint_alias_candidates(candidate_name):
+                    if renamed_name not in seen:
+                        seen.add(renamed_name)
+                        candidates.append(renamed_name)
                 for alias in self._module_tree_name_aliases(candidate_name):
                     if alias in seen:
                         continue
