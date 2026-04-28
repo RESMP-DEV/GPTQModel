@@ -50,15 +50,12 @@ class NamedModule(torch.nn.Module):
         elif isinstance(module, _ConvNd):
             in_features = module.in_channels
             out_features = module.out_channels
-        # elif isinstance(module, nn.Conv2d):
-        #     in_features = module.in_channels
-        #     out_features = module.out_channels
-        # elif isinstance(module, nn.Conv2d):
-        #     in_features = module.in_channels
-        #     out_features = module.out_channels
         elif isinstance(module, transformers.pytorch_utils.Conv1D):
             in_features = module.weight.shape[0]
             out_features = module.weight.shape[1]
+        elif hasattr(module, "in_features") and hasattr(module, "out_features"):
+            in_features = module.in_features
+            out_features = module.out_features
         else:
             in_features = None
             out_features = None

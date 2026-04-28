@@ -424,7 +424,8 @@ class ModuleLooper():
 
         def __enter__(self):
             """Set up MoE lifecycle hooks if applicable."""
-            if self.module_looper._should_use_moe_lifecycle(self.module, self.processor):
+            should = self.module_looper._should_use_moe_lifecycle(self.module, self.processor)
+            if should:
                 hooks = self.module_looper.gptq_model.moe_lifecycle_hooks
                 self.moe_block = hooks.get_moe_block(self.module, self.module_looper.gptq_model.__class__)
 
@@ -1012,6 +1013,8 @@ class ModuleLooper():
         quant_source = named_module.state.get("quant_source_module")
         if isinstance(quant_source, torch.nn.Module) and hasattr(task, "module"):
             task.module = quant_source
+        elif hasattr(task, "module") and task.module is not named_module.module:
+            task.module = named_module.module
 
         to_device_fn = getattr(task, "to_device", None)
         if callable(to_device_fn):
@@ -1046,6 +1049,24 @@ class ModuleLooper():
         if hasattr(task, "dev"):
             task.dev = target_device
 
+    def _set_submodule_in_model(self, full_name: str, new_module: nn.Module) -> None:
+        """Replace a submodule in the model tree by its dotted path."""
+        parts = full_name.split('.')
+        if len(parts) < 2:
+            return
+        parent = self.gptq_model.model
+        for part in parts[:-1]:
+            if hasattr(parent, '__getitem__') and part.isdigit():
+                parent = parent[int(part)]
+            elif hasattr(parent, part):
+                parent = getattr(parent, part)
+            else:
+                return
+        try:
+            setattr(parent, parts[-1], new_module)
+        except Exception:
+            pass
+
     def _prepare_named_module_for_forward(
         self,
         named_module: NamedModule,
@@ -1065,6 +1086,7 @@ class ModuleLooper():
         )
         if prepared is not named_module.module:
             named_module.module = prepared
+            self._set_submodule_in_model(named_module.full_name, prepared)
 
         setattr(named_module, "target_device", target_device)
         setattr(named_module.module, "target_device", target_device)
@@ -1097,6 +1119,7 @@ class ModuleLooper():
             )
             if prepared is not named_module.module:
                 named_module.module = prepared
+                self._set_submodule_in_model(named_module.full_name, prepared)
         else:
             move_to(named_module.module, device=target_device)
         rehome_module_to_device(named_module.module, target_device, move_parameters=True, move_buffers=True)
@@ -1342,7 +1365,6 @@ class ModuleLooper():
         """
         def pre_hook(module, inputs, output):
             """Apply the current keep mask before invoking the wrapped pre-hook."""
-
             # Thread-safe check if hooks are paused (TLS-based, per-thread)
             if self._get_processor_hooks_paused(processor):
                 return

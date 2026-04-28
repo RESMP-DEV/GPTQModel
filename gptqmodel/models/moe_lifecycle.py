@@ -385,24 +385,25 @@ class ExpertProjectionMoELifecycleHooks(MoELifecycleHooks):
             """
             Get the callable module for a given subset key.
 
-            When replica_module is provided, resolves the module from the replica
-            using the key as a relative path. This ensures forward passes happen
-            on the correct device for multi-GPU execution.
+            Prefers the subset's inner module for keys present in the current
+            subset because forward hooks (GPTQ calibration) are registered on
+            those objects.  The replica tree may hold a different object (e.g.
+            the original _PackedLinear before materialisation) which would not
+            have hooks and would silently produce 0 calibration samples.
 
-            Falls back to subset[key] when replica is not provided or lookup fails.
+            For keys NOT in the subset (experts outside the current MoE chunk),
+            falls back to the replica tree so their forwards still execute on the
+            correct device.
             """
-            # The key is already a relative path (e.g., "mlp.experts.0.gate_proj")
-            # Use it directly to look up the module in the replica
+            subset_module = subset.get(key)
+            if subset_module is not None:
+                return getattr(subset_module, 'module', subset_module)
+
             if replica_module is not None:
                 replica_submodule = _get_module_by_relative_path(replica_module, key)
                 if replica_submodule is not None:
                     return replica_submodule
-                else:
-                    raise ValueError(f"[MoE DEBUG] replica_submodule is None for key={key}")
-
-            # Fallback to using subset (original behavior for single-GPU)
-            subset_module = subset.get(key)
-            return subset_module
+            return None
 
         # Get experts modules and shared expert attribute name
         experts_module = self.get_experts_module(moe_block, model_class)
@@ -467,14 +468,18 @@ class ExpertProjectionMoELifecycleHooks(MoELifecycleHooks):
                 if gate_key not in subset and up_key not in subset and down_key not in subset:
                     continue
 
-                gate_module_ref = getattr(expert, self.gate_proj_name, None)
-                expert_device = get_device(gate_module_ref) if gate_module_ref is not None else get_device(expert)
+                gate_resolved = get_callable_module(gate_key) or get_callable_module(up_key)
+                if gate_resolved is not None:
+                    expert_device = get_device(gate_resolved)
+                else:
+                    gate_module_ref = getattr(expert, self.gate_proj_name, None)
+                    expert_device = get_device(gate_module_ref) if gate_module_ref is not None else get_device(expert)
                 expert_input = move_to(hidden_states_2d, expert_device)
 
                 try:
                     if down_key in subset:
-                        gate_module = getattr(expert, self.gate_proj_name)
-                        up_module = getattr(expert, self.up_proj_name)
+                        gate_module = get_callable_module(gate_key) or getattr(expert, self.gate_proj_name)
+                        up_module = get_callable_module(up_key) or getattr(expert, self.up_proj_name)
                         gate_out = gate_module(expert_input)
                         up_out = up_module(expert_input)
 
@@ -484,7 +489,9 @@ class ExpertProjectionMoELifecycleHooks(MoELifecycleHooks):
                             intermediate = F.silu(gate_out) * up_out
                         del gate_out, up_out
 
-                        get_callable_module(down_key)(intermediate)
+                        down_module = get_callable_module(down_key)
+                        intermediate = move_to(intermediate, get_device(down_module))
+                        down_module(intermediate)
                         del intermediate
                         expert_count += 1
                     else:

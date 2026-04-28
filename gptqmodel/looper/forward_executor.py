@@ -76,11 +76,11 @@ class ForwardExecutor:
         """Pick the MoE routing context for a forward pass."""
 
         if not apply_moe_config:
-            # Replay forwards opt out of quant-time MoE overrides and bypass hooks.
             return nullcontext()
         if self.looper.moe_routing_override:
             return self.looper.MoERoutingOverrideContext(module, self.looper.moe_routing_override)
-        if not getattr(self.looper, "moe_routing_bypass", False):
+        bypass = getattr(self.looper, "moe_routing_bypass", False)
+        if not bypass:
             return nullcontext()
 
         should_use_lifecycle = getattr(self.looper, "_should_use_moe_lifecycle", None)
