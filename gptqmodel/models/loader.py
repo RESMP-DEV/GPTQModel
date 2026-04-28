@@ -49,10 +49,19 @@ from ..utils.inspect import safe_kwargs_call
 from ..utils.logger import setup_logger
 from ..utils.machete import _validate_machete_device_support
 from ..utils.marlin import _marlin_capability_supported, _validate_marlin_device_support
-from ..utils.model import (auto_dtype, convert_gptq_v1_to_v2_format, find_config_seq_len, find_modules,
-                           get_checkpoints, get_module_by_name_prefix, gptqmodel_post_init,
-                           load_checkpoint_in_model_then_tie_weights, make_quant, simple_dispatch_model)
-from ._const import DEVICE, normalize_device
+from ..utils.model import (
+    auto_dtype,
+    convert_gptq_v1_to_v2_format,
+    find_config_seq_len,
+    find_modules,
+    get_checkpoints,
+    get_module_by_name_prefix,
+    gptqmodel_post_init,
+    load_checkpoint_in_model_then_tie_weights,
+    make_quant,
+    simple_dispatch_model,
+)
+from ._const import DEVICE, HAS_NPU, normalize_device
 
 log = setup_logger()
 
@@ -1139,6 +1148,11 @@ def ModelLoader(cls):
                     device_strs = [f"xpu:{i}" for i in range(num_gpus)]
                 else:
                     raise RuntimeError("XPU is not available")
+            elif device == DEVICE.NPU:
+                if HAS_NPU:
+                    device_strs = [f"npu:{i}" for i in range(num_gpus)]
+                else:
+                    raise RuntimeError("NPU is not available")
             else:
                 device_strs = ["cpu"] * num_gpus
 
@@ -1289,6 +1303,8 @@ def ModelLoader(cls):
                 num_gpus = torch.cuda.device_count()
             elif device is DEVICE.XPU:
                 num_gpus = torch.xpu.device_count()
+            elif device is DEVICE.NPU:
+                num_gpus = torch.npu.device_count()
             device_map = build_layerwise_device_map(model, device, layers, ignore_modules, num_gpus)
         else:
             device_map = dict(explicit_device_map)
