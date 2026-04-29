@@ -1,6 +1,6 @@
 # Changelog
 
-This file tracks AlphaHENG-local changes and concise sync summaries for `gptqmodel`.
+This file tracks local fork changes and concise sync summaries for `gptqmodel`.
 
 ## Recording rules
 

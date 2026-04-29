@@ -10,7 +10,8 @@ This module provides a base class for model-specific MoE lifecycle hooks that al
 customization of MoE forward passes and routing logic during quantization.
 """
 
-from typing import Any, Dict, Optional
+from collections import defaultdict
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -450,6 +451,59 @@ class ExpertProjectionMoELifecycleHooks(MoELifecycleHooks):
             except StopForward:
                 stop_forward_raised = True
 
+        def _run_expert_single(expert_idx, expert, hidden_states_2d):
+            """Run forward for a single expert. Returns (count, stop_raised)."""
+            gate_key = f"{moe_block_prefix}.{experts_attr_name}.{expert_idx}.{self.gate_proj_name}"
+            up_key = f"{moe_block_prefix}.{experts_attr_name}.{expert_idx}.{self.up_proj_name}"
+            down_key = f"{moe_block_prefix}.{experts_attr_name}.{expert_idx}.{self.down_proj_name}"
+
+            if gate_key not in subset and up_key not in subset and down_key not in subset:
+                return 0, False
+
+            gate_resolved = get_callable_module(gate_key) or get_callable_module(up_key)
+            if gate_resolved is not None:
+                expert_device = get_device(gate_resolved)
+            else:
+                gate_module_ref = getattr(expert, self.gate_proj_name, None)
+                expert_device = get_device(gate_module_ref) if gate_module_ref is not None else get_device(expert)
+            expert_input = move_to(hidden_states_2d, expert_device)
+
+            count = 0
+            stopped = False
+            try:
+                if down_key in subset:
+                    gate_module = get_callable_module(gate_key) or getattr(expert, self.gate_proj_name)
+                    up_module = get_callable_module(up_key) or getattr(expert, self.up_proj_name)
+                    gate_out = gate_module(expert_input)
+                    up_out = up_module(expert_input)
+
+                    if hasattr(expert, 'act_fn'):
+                        intermediate = expert.act_fn(gate_out) * up_out
+                    else:
+                        intermediate = F.silu(gate_out) * up_out
+                    del gate_out, up_out
+
+                    down_module = get_callable_module(down_key)
+                    intermediate = move_to(intermediate, get_device(down_module))
+                    down_module(intermediate)
+                    del intermediate
+                    count = 1
+                else:
+                    called_any = False
+                    if gate_key in subset:
+                        get_callable_module(gate_key)(expert_input)
+                        called_any = True
+                    if up_key in subset:
+                        get_callable_module(up_key)(expert_input)
+                        called_any = True
+                    if called_any:
+                        count = 1
+            except StopForward:
+                stopped = True
+            finally:
+                del expert_input
+            return count, stopped
+
         def run_routed_experts():
             nonlocal expert_count, stop_forward_raised
             if not has_expert_projs or experts_module is None or not hasattr(experts_module, '__iter__') or not experts_attr_name:
@@ -460,55 +514,63 @@ class ExpertProjectionMoELifecycleHooks(MoELifecycleHooks):
             else:
                 hidden_states_2d = hidden_states
 
+            # Group experts by target device for parallel dispatch across GPUs.
+            # NVLink-connected GPUs get true concurrent execution; PCIe-only GPUs
+            # still benefit from overlapping CPU→GPU transfers with computation.
+            device_groups: Dict[torch.device, List[Tuple[int, Any]]] = defaultdict(list)
             for expert_idx, expert in enumerate(experts_module):
                 gate_key = f"{moe_block_prefix}.{experts_attr_name}.{expert_idx}.{self.gate_proj_name}"
                 up_key = f"{moe_block_prefix}.{experts_attr_name}.{expert_idx}.{self.up_proj_name}"
                 down_key = f"{moe_block_prefix}.{experts_attr_name}.{expert_idx}.{self.down_proj_name}"
-
                 if gate_key not in subset and up_key not in subset and down_key not in subset:
                     continue
-
                 gate_resolved = get_callable_module(gate_key) or get_callable_module(up_key)
                 if gate_resolved is not None:
-                    expert_device = get_device(gate_resolved)
+                    target_dev = get_device(gate_resolved)
                 else:
-                    gate_module_ref = getattr(expert, self.gate_proj_name, None)
-                    expert_device = get_device(gate_module_ref) if gate_module_ref is not None else get_device(expert)
-                expert_input = move_to(hidden_states_2d, expert_device)
+                    gate_ref = getattr(expert, self.gate_proj_name, None)
+                    target_dev = get_device(gate_ref) if gate_ref is not None else get_device(expert)
+                device_groups[target_dev].append((expert_idx, expert))
 
-                try:
-                    if down_key in subset:
-                        gate_module = get_callable_module(gate_key) or getattr(expert, self.gate_proj_name)
-                        up_module = get_callable_module(up_key) or getattr(expert, self.up_proj_name)
-                        gate_out = gate_module(expert_input)
-                        up_out = up_module(expert_input)
+            n_devices = len(device_groups)
+            if n_devices <= 1:
+                # Single device: run serially (no thread pool overhead)
+                for expert_idx, expert in enumerate(experts_module):
+                    c, s = _run_expert_single(expert_idx, expert, hidden_states_2d)
+                    expert_count += c
+                    if s:
+                        stop_forward_raised = True
+                return
 
-                        if hasattr(expert, 'act_fn'):
-                            intermediate = expert.act_fn(gate_out) * up_out
-                        else:
-                            intermediate = F.silu(gate_out) * up_out
-                        del gate_out, up_out
+            # Multi-device: dispatch device groups to thread pool
+            from .. import DEVICE_THREAD_POOL
 
-                        down_module = get_callable_module(down_key)
-                        intermediate = move_to(intermediate, get_device(down_module))
-                        down_module(intermediate)
-                        del intermediate
-                        expert_count += 1
-                    else:
-                        called_any = False
-                        if gate_key in subset:
-                            get_callable_module(gate_key)(expert_input)
-                            called_any = True
-                        if up_key in subset:
-                            get_callable_module(up_key)(expert_input)
-                            called_any = True
-                        if called_any:
-                            expert_count += 1
+            def _run_device_group(device: torch.device, experts_on_device: List[Tuple[int, Any]]):
+                group_count = 0
+                group_stopped = False
+                for eidx, emod in experts_on_device:
+                    c, s = _run_expert_single(eidx, emod, hidden_states_2d)
+                    group_count += c
+                    if s:
+                        group_stopped = True
+                return group_count, group_stopped
 
-                except StopForward:
+            futures = []
+            for device, expert_list in device_groups.items():
+                futures.append(
+                    DEVICE_THREAD_POOL.submit(
+                        device,
+                        _run_device_group,
+                        device,
+                        expert_list,
+                    )
+                )
+
+            for fut in futures:
+                gc, gs = fut.result()
+                expert_count += gc
+                if gs:
                     stop_forward_raised = True
-                finally:
-                    del expert_input
 
         execution_order = self.get_subset_execution_order(
             ordered_module_names=ordered_module_names or [],

@@ -493,7 +493,20 @@ def build_subset_plan(
                     named_module.state["preferred_quant_device"] = preferred_device
 
             restore_forward_device_overrides = False
-            subset_forward_serial = True
+            # Default: serial forward when modules span multiple devices.
+            # Override: NVLink-connected GPUs can run parallel forwards safely
+            # because CUDA kernels release the GIL and NVLink provides high-BW
+            # inter-GPU data movement for activation broadcast/gather.
+            from ..utils.nvlink import get_topology
+            topo = get_topology()
+            if topo.has_nvlink() and is_moe_subset:
+                subset_forward_serial = False
+                setup_logger().info(
+                    "NVLink detected (%d pairs): enabling parallel MoE forward across %d devices",
+                    len(topo.nvlink_pairs), len(moe_devices) if moe_strategy_active else 0,
+                )
+            else:
+                subset_forward_serial = True
 
     auto_forward_data_parallel = getattr(
         looper.gptq_model.quantize_config,
