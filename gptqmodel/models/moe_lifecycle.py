@@ -474,13 +474,13 @@ class ExpertProjectionMoELifecycleHooks(MoELifecycleHooks):
                 if down_key in subset:
                     gate_module = get_callable_module(gate_key) or getattr(expert, self.gate_proj_name)
                     up_module = get_callable_module(up_key) or getattr(expert, self.up_proj_name)
-                    gate_out = gate_module(expert_input)
-                    up_out = up_module(expert_input)
+                    gate_out = gate_module(move_to(expert_input, get_device(gate_module)))
+                    up_out = up_module(move_to(expert_input, get_device(up_module)))
 
                     if hasattr(expert, 'act_fn'):
-                        intermediate = expert.act_fn(gate_out) * up_out
+                        intermediate = expert.act_fn(gate_out) * up_out.to(gate_out.device)
                     else:
-                        intermediate = F.silu(gate_out) * up_out
+                        intermediate = F.silu(gate_out) * up_out.to(gate_out.device)
                     del gate_out, up_out
 
                     down_module = get_callable_module(down_key)
@@ -491,10 +491,12 @@ class ExpertProjectionMoELifecycleHooks(MoELifecycleHooks):
                 else:
                     called_any = False
                     if gate_key in subset:
-                        get_callable_module(gate_key)(expert_input)
+                        m = get_callable_module(gate_key)
+                        m(move_to(expert_input, get_device(m)))
                         called_any = True
                     if up_key in subset:
-                        get_callable_module(up_key)(expert_input)
+                        m = get_callable_module(up_key)
+                        m(move_to(expert_input, get_device(m)))
                         called_any = True
                     if called_any:
                         count = 1

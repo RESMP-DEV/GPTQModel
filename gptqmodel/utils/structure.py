@@ -1136,11 +1136,17 @@ class LazyTurtle:
 
     @classmethod
     def reverse_hf_conversion_map(cls, conversion_mapping: Any | None) -> list[_LazyWeightRenaming] | None:
-        """Invert simple HF checkpoint renames into reversed `WeightRenaming`-style rules."""
+        """Invert simple HF checkpoint renames into reversed `WeightRenaming`-style rules.
+
+        The HF forward mapping applies structural prefix renames (pass 1) before
+        leaf renames (pass 2).  The reverse must undo pass 2 first, then pass 1,
+        so we reverse the rule list.
+        """
         reversed_map: list[_LazyWeightRenaming] = []
         for checkpoint_pattern, runtime_prefix in cls._iter_hf_conversion_pairs(conversion_mapping):
             reversed_map.append(_LazyWeightRenaming(runtime_prefix, checkpoint_pattern))
 
+        reversed_map.reverse()
         return reversed_map or None
 
     @classmethod
