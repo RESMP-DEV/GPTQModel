@@ -197,3 +197,6 @@ AGENTs.md
 .codex
 temp
 tmp
+
+# Local semantic-search index
+.sindexer/
